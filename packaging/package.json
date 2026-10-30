@@ -1,0 +1,43 @@
+{
+  "name": "rocket-launch-simulator",
+  "version": "1.0.0",
+  "description": "长征十号·火箭发射模拟器（发射→入轨）- 课堂独立运行版",
+  "main": "main.js",
+  "author": "航天科普课堂",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "cn.cstm.rocketsimulator.classroom.v1",
+    "productName": "长征十号火箭发射模拟器",
+    "copyright": "Copyright © 2026",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "app/**/*",
+      "build/icon.ico"
+    ],
+    "win": {
+      "target": {
+        "target": "portable",
+        "arch": [
+          "x64"
+        ]
+      },
+      "icon": "build/icon.ico",
+      "artifactName": "RocketLaunchSimulator.exe"
+    },
+    "portable": {},
+    "asar": true,
+    "compression": "maximum"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  }
+}

@@ -1,0 +1,11 @@
+# 依赖与构建产物（exe 安装包体积大，走 Release 发布，不进仓库）
+node_modules/
+packaging/node_modules/
+packaging/dist/
+
+# 系统与编辑器垃圾
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

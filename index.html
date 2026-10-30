@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>长征十号 · 火箭发射模拟器（发射 → 入轨）</title>
+<!--
+  =============================================================================
+  零依赖单页应用。双击本文件即可运行，不需要安装任何东西、不需要联网。
+
+  ⚠ 为什么这里没有 <script type="module">（见 docs/architecture/adr-001）
+    file:// 协议下浏览器把每个本地文件当成"不透明来源"，ES Module 会被 CORS
+    策略直接拦截（控制台报 "Cross origin requests are only supported for
+    protocol schemes: http, https..."）。所以本项目一律用传统
+    <script src> 顺序加载 + 全局命名空间 window.RK 挂载，彻底绕开这个坑。
+
+    加载顺序 = 依赖顺序（后面的依赖前面的），不能随意调换：
+      constants → atmo → vehicle → dynamics → orbit → steering → sim
+      → replay / config / a11y / input / timeline / svg-rocket / render
+      / hud / modes / score → main
+  =============================================================================
+-->
+<style>
+/* ---------------------------------------------------------------------------
+   主题变量（design/art/art-bible.md §3 色板）
+   演示模式强制浅色（用户决策 #1）：投影环境下浅底黑字的可读性远高于深底。
+   挑战模式默认深色，可在设置里切。
+   ------------------------------------------------------------------------ */
+:root{
+  --hud-scale:1;
+  --c-bg:#eef3f8; --c-surface:#ffffff; --c-surface-2:#f4f7fa;
+  --c-text:#12222f; --c-text-2:#3f4d5e; --c-line:#c8d6e0;
+  --c-primary:#0B3D6B; --c-primary-soft:#dce8f2; --c-primary-2:#3d84c4;
+
+  /* ── 版面骨架 token ────────────────────────────────────────────────
+     所有绝对定位的 HUD 块只准引用这四个值，不许再写魔法数字。
+     改小屏只需在媒体查询里覆盖 --gutter / --col-w，全站跟着动。     */
+  --gutter:24px;                 /* 屏幕左右安全边距 */
+  --col-w:300px;                 /* 左 / 右信息列宽 */
+  --band-safe:128px;             /* 底部安全线：时间线上沿 + 12px 呼吸位 */
+  --band-badge:244px;            /* 成就徽章：安全线 + 116px，让开姿态仪 */
+
+  /* ── 间距：4px 基线 ──────────────────────────────────────────────── */
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px;
+  --sp-5:20px; --sp-6:24px; --sp-8:32px;
+
+  /* ── 字号：1.25 模块化音阶，9 档（原 21 档收敛而来）────────────────
+     13 → 15 → 17 → 20 → 24 → 30 → 38 → 48 → 60
+     带上 --hud-scale（用户可在设置里调 0.85 / 1.0 / 1.25×）。       */
+  --fs-xs:calc(13px * var(--hud-scale));
+  --fs-sm:calc(15px * var(--hud-scale));
+  --fs-md:calc(17px * var(--hud-scale));
+  --fs-lg:calc(20px * var(--hud-scale));
+  --fs-xl:calc(24px * var(--hud-scale));
+  --fs-2xl:calc(30px * var(--hud-scale));
+  --fs-3xl:calc(38px * var(--hud-scale));
+  --fs-4xl:calc(48px * var(--hud-scale));
+  --fs-hero:calc(60px * var(--hud-scale));
+
+  /* ── 圆角 ────────────────────────────────────────────────────────── */
+  --r-sm:6px; --r-md:8px; --r-lg:12px;
+  /* 强调色拆成两个：--c-accent 只用于【文字】，--c-accent-gfx 只用于【图形】。
+     因为同一个橙色在浅底上跑文字需要 4.5:1（#C2410C），跑图形只要可辨识
+     （#FF6A13，与尾焰同色，保住"橙 = 能量"这个视觉锚点）。 */
+  --c-accent:#C2410C; --c-accent-gfx:#FF6A13;
+  --sev-nominal:#0B524B; --sev-caution:#6B4500; --sev-warning:#8a3808; --sev-danger:#8E1414;
+  --mono: ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+html[data-theme="dark"]{
+  --c-bg:#050b1a; --c-surface:#0d1725; --c-surface-2:#132133;
+  --c-text:#e8f0f8; --c-text-2:#9db0c4; --c-line:#24354c;
+  --c-primary:#6fb6ea; --c-primary-soft:#17304a; --c-primary-2:#3f8fc9;
+  --c-accent:#FF8A3D; --c-accent-gfx:#FF6A13;
+  --sev-nominal:#2DD4BF; --sev-caution:#e3c453; --sev-warning:#ff9d4a; --sev-danger:#ff6b6b;
+}
+/* ── A-1 语义色为什么改（art-bible.md「实装色值偏差清单」）──────────────────
+   ① --sev-nominal 原 #2e7d32 是【纯绿】，红绿色盲下与 --sev-danger #c62828
+      的明度只有 0.155 vs 0.138，几乎无法区分 → 改成青绿 #0B524B / #2DD4BF，
+      靠色相而非明度拉开，且对比度 8.06:1 / 10.54:1。
+   ② --sev-caution 原 #b8860b 对比度仅 2.91:1，投影环境下告警实质失效。
+   ③ --c-accent 原 #e07a1f 只有 2.70:1，排 16 px 文字不可读。
+   深色主题除 nominal 外原本全部达标（7.07–11.49:1），故只改 nominal 与 accent。
+   ⚠ 改这里的同时必须同步 src/app/render.js 的 THEME（Canvas 读不到 CSS 变量），
+     语义 → 两处键名的映射表见 design/art/art-bible.md 顶部。
+   ---------------------------------------------------------------------- */
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--c-bg);color:var(--c-text);
+  font-family:var(--sans);-webkit-font-smoothing:antialiased}
+button,select,input{font-family:inherit;font-size:inherit;color:inherit}
+
+/* 舞台：Canvas 背景 + SVG 箭体 + DOM HUD 三层叠放（asset-spec §7.4 图层栈） */
+#stage{position:fixed;inset:0}
+#fx-canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
+#rocket-layer{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+#hud-root{position:absolute;inset:0;pointer-events:none}
+/* HUD 默认不吃鼠标事件（火箭画面要能透传），只给确实需要交互的控件开。
+   FIX-003 问题 B：补上 .hud-side —— 它 overflow:auto，但拿不到鼠标事件，
+   滚轮和拖滚动条都失效，L3 下 771 px 内容里一半永远看不见。 */
+#hud-root button,#hud-root .tl,#hud-root select,
+#hud-root .hud-side{pointer-events:auto}
+
+/* ---- SVG 箭体：20×102 用户单位 = 米，transform-origin 落在箭体坐标原点 ---- */
+.rk-svg{position:absolute;left:0;top:0;width:20px;height:102px;
+  transform-origin:10px 96px;overflow:visible;will-change:transform}
+.rk-body{fill:var(--c-primary-soft);stroke:var(--c-primary);stroke-width:2;
+  vector-effect:non-scaling-stroke}
+.rk-weld{stroke:var(--c-primary);stroke-width:2;opacity:.5;fill:none;
+  vector-effect:non-scaling-stroke}
+.rk-band{stroke:var(--c-primary-2);stroke-width:1;fill:none;opacity:.8;
+  vector-effect:non-scaling-stroke}
+.rk-nozzle{fill:var(--c-text-2);stroke:var(--c-text-2);stroke-width:2;
+  vector-effect:non-scaling-stroke}
+.rk-back{opacity:.72}
+.rk-fair-body{fill:var(--c-primary-soft);stroke:var(--c-primary);stroke-width:2;
+  vector-effect:non-scaling-stroke}
+/* 剖切切口：实线 + 主色（art-bible §8 锚点3——橙是「能量」专用，不被剖切稀释）
+   全局规则：虚线 = 将来/预测，实线 = 当前状态。分离面用虚线，切口用实线 */
+.is-cutaway .rk-fair-body{fill-opacity:.25;
+  stroke:var(--c-primary);stroke-width:3;stroke-dasharray:none}
+.is-cutaway .rk-ship-body{stroke-width:3}
+.rk-seam{stroke:var(--c-accent-gfx);stroke-width:3;stroke-dasharray:8 6;fill:none;
+  vector-effect:non-scaling-stroke}
+.rk-truss{stroke:var(--c-text-2);stroke-width:2;fill:none;
+  vector-effect:non-scaling-stroke}
+.rk-tower-motor{fill:var(--c-text-2);stroke:var(--c-text-2);stroke-width:2;
+  vector-effect:non-scaling-stroke}
+.rk-ship-body{fill:var(--c-surface);stroke:var(--c-primary);stroke-width:2;
+  vector-effect:non-scaling-stroke}
+.rk-heat{fill:var(--c-accent-gfx);fill-opacity:.2;stroke:var(--c-accent-gfx);stroke-width:3;
+  vector-effect:non-scaling-stroke}
+.rk-window{fill:var(--c-primary-2);fill-opacity:.4;stroke:var(--c-primary);stroke-width:2;
+  vector-effect:non-scaling-stroke}
+.rk-wing{fill:var(--c-primary-soft);stroke:var(--c-primary-2);stroke-width:1;
+  vector-effect:non-scaling-stroke}
+
+/* 缩放线宽分档（art-bible §5.3）：补偿 non-scaling-stroke 在放大讲解时线偏细
+   结构线 2→2.5→3，细节线 1→1.5→2，由 JS 按 cam.zoom 挂 rk-z1/z2/z3 */
+.rk-body,.rk-fair-body,.rk-ship-body,.rk-truss,.rk-tower-motor,.rk-nozzle,
+.rk-window,.rk-band,.rk-weld,.rk-wing{transition:stroke-width 200ms ease}
+.rk-z2 .rk-body,.rk-z2 .rk-fair-body,.rk-z2 .rk-ship-body,.rk-z2 .rk-truss,
+.rk-z2 .rk-tower-motor,.rk-z2 .rk-nozzle,.rk-z2 .rk-window,.rk-z2 .rk-band,
+.rk-z2 .rk-weld{stroke-width:2.5}
+.rk-z3 .rk-body,.rk-z3 .rk-fair-body,.rk-z3 .rk-ship-body,.rk-z3 .rk-truss,
+.rk-z3 .rk-tower-motor,.rk-z3 .rk-nozzle,.rk-z3 .rk-window,.rk-z3 .rk-band,
+.rk-z3 .rk-weld{stroke-width:3}
+.rk-z2 .rk-wing{stroke-width:1.5}
+.rk-z3 .rk-wing{stroke-width:2}
+@media (prefers-reduced-motion:reduce){
+  .rk-body,.rk-fair-body,.rk-ship-body,.rk-truss,.rk-tower-motor,.rk-nozzle,
+  .rk-window,.rk-band,.rk-weld,.rk-wing{transition:none}
+}
+.rk-hidden{display:none}
+
+/* ---------------------------------------------------------------------------
+   HUD
+   数字全部等宽 + tabular-nums + 固定小数位（ui-spec §1.3 硬性要求）
+   ------------------------------------------------------------------------ */
+.hud{position:absolute;inset:0;font-size:calc(16px * var(--hud-scale))}
+.hud .ro-val,.hud .hud-time,.hud .prop-pct,.hud .dv-row b,.hud .orb-row b,
+.hud .chk-row b,.hud .att-txt,.hud .tl-label{
+  font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+/* 游离字号归位：<sub>（原 14.17px）与 .kbd（原 13.5px）此前不在任何档位上 */
+.hud sub,.hud sup{font-size:.75em}
+.hud-tl{position:absolute;left:var(--gutter);top:var(--sp-5)}
+.hud-time{font-size:var(--fs-3xl);font-weight:600;letter-spacing:.02em}
+.hud-event{font-size:var(--fs-xl);opacity:.9;margin-top:var(--sp-1)}
+.hud-next{font-size:var(--fs-lg);opacity:.65;margin-top:var(--sp-1)}
+.hud-tr{flex:none;text-align:right}
+.ro{margin-bottom:var(--sp-2)}
+.ro-label{font-size:var(--fs-sm);opacity:.7;letter-spacing:.08em}
+.ro-line{display:flex;align-items:center;justify-content:flex-end;gap:var(--sp-2)}
+.ro-val{font-size:var(--fs-2xl);font-weight:600}
+.ro-unit{font-size:var(--fs-sm);opacity:.7}
+.ro-big .ro-val{font-size:var(--fs-hero);line-height:1.05;font-weight:700}
+.ro-mark{width:calc(20px * var(--hud-scale));height:calc(20px * var(--hud-scale));flex:0 0 auto}
+
+/* 左下竖列：推进剂 + 姿态指示器（挑战模式才显示姿态区）
+   两个块都 absolute 时，姿态区会被右侧数据面板盖住（详见 hud.js 注释），
+   改成一个 flex 竖列后由布局自动分配，不再与右侧列抢地盘。
+   align-items:flex-start —— 姿态区比推进剂窄（160 vs 300），
+   若用默认 stretch 会被拉宽导致圆盘变形。 */
+.hud-lcol{position:absolute;left:var(--gutter);bottom:var(--band-safe);
+  display:flex;flex-direction:column;align-items:flex-start;gap:var(--sp-3);
+  max-height:calc(100% - var(--band-safe) - var(--sp-8))}
+.hud-bl{width:var(--col-w)}
+.hud-br{width:var(--col-w);flex:0 1 auto;min-height:0}
+.prop-title{font-size:var(--fs-sm);opacity:.7;letter-spacing:.08em}
+.prop-row{display:flex;align-items:center;gap:var(--sp-2);margin:var(--sp-1) 0;opacity:.55}
+.prop-row.is-active{opacity:1}
+.prop-name{width:3.2em;font-size:var(--fs-md)}
+.prop-bar{flex:1;height:16px;background:var(--c-surface-2);
+  border:1px solid var(--c-line);border-radius:3px;overflow:hidden}
+.prop-fill{display:block;height:100%;width:100%;background:var(--c-primary-2);
+  transition:width .3s linear}
+.prop-row.is-active .prop-fill{background:var(--c-accent-gfx)}
+.prop-pct{width:3.2em;text-align:right;font-size:var(--fs-sm)}
+.prop-burn{margin-top:var(--sp-2);font-size:var(--fs-md);opacity:.75;
+  font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* .hud-br 的定位已交给 .hud-lcol（见 .hud-lcol 处的定义），此处不再重复 */
+.att{width:calc(160px * var(--hud-scale))}
+/* 姿态圆盘默认 width:100% 会跟着列宽（300px）撑成一张大饼，
+   把左下竖列顶得过高。限制在 180px 并居中，既能看清又不吃掉竖直空间。 */
+.att-svg{width:100%;max-width:180px;margin:0 auto;display:block}
+.att-bg{fill:var(--c-surface);stroke:var(--c-line);stroke-width:2}
+.att-sky{fill:var(--c-primary-soft);opacity:.5}
+.att-line{stroke:var(--c-text-2);stroke-width:2}
+.att-ladder{stroke:var(--c-text-2);stroke-width:1.5;opacity:.5;fill:none}
+.att-thrust{stroke:var(--c-accent-gfx);stroke-width:3;fill:none}
+.att-vel{stroke:var(--c-primary-2);stroke-width:2.5;fill:none;opacity:.9}
+.att-hub{fill:var(--c-text)}
+.att-txt{text-align:center;font-size:var(--fs-md);margin-top:var(--sp-1)}
+/* 操控状态读数：偏置 / 油门 / 制导模式。
+   用 tabular-nums 防止数字宽度跳动（偏置从 +9.9 跳到 +10.0 时若字宽变化，
+   整行会左右抖动，学生读数时很难受）。
+   比 att-txt 低一级字号，但用主题主色保证在深色主题下依然清晰。 */
+.att-ctl{text-align:center;font-size:var(--fs-sm);margin-top:var(--sp-1);
+  font-family:var(--mono);font-variant-numeric:tabular-nums;
+  font-feature-settings:"tnum" 1;color:var(--c-primary-2);font-weight:600;
+  padding:2px var(--sp-2);border-radius:4px;
+  background:color-mix(in srgb,var(--c-surface) 72%,transparent)}
+html[data-theme="dark"] .att-ctl{color:var(--c-accent-gfx)}
+
+/* FIX-003 问题 A / C：右侧改为一根按视口钉死上下边界的 flex 竖列。
+   列高 = 100% - 18px - 150px（150px 让给底部时间线 + 控制条），
+   读数块 flex:none 取自然高度，面板 flex:1 + min-height:0 吃掉剩余高度。
+   旧的 max-height:calc(100% - 340px) 其实生效了（实测 clientHeight=428），
+   真正的问题是 top:200px 写死 + L3 读数块高 373 px → 面板顶部被压住，
+   且滚动条拿不到鼠标，下半截内容（数据核验）根本滚不出来。 */
+.hud-rcol{position:absolute;right:var(--gutter);top:var(--sp-5);
+  bottom:var(--band-safe);width:var(--col-w);
+  display:flex;flex-direction:column;gap:var(--sp-3);align-items:stretch}
+.hud-side{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain}
+.panel{background:color-mix(in srgb, var(--c-surface) 88%, transparent);
+  border:1px solid var(--c-line);border-radius:var(--r-md);
+  padding:var(--sp-2) var(--sp-3);margin-bottom:var(--sp-2)}
+.panel-h{font-size:var(--fs-sm);letter-spacing:.08em;opacity:.7;
+  margin-bottom:var(--sp-1)}
+.panel-b{font-size:var(--fs-md)}
+.dv-row,.orb-row,.chk-row{display:flex;justify-content:space-between;gap:var(--sp-2);
+  padding:1px 0}
+.dv-row b,.orb-row b,.chk-row b{font-weight:600}
+.dv-res b{color:var(--sev-nominal)}
+.is-neg{color:var(--sev-danger)}
+.is-ok{color:var(--sev-nominal)}
+/* 严重度第二重编码：形状边数（圆/八角），accessibility.md §2
+   颜色只是辅助——红绿色盲下 nominal 与 danger 的明度差不足以可靠区分，
+   而形状在色觉缺失和大屏投影失真下都不会变。用 currentColor 跟随语义色。 */
+.is-ok::before,.is-neg::before,.panel-hint.is-ok::before,.panel-hint.is-neg::before,
+.dv-res b::before,.res-fail::before{
+  content:'';display:inline-block;width:.62em;height:.62em;margin-right:.38em;
+  vertical-align:-.06em;background:currentColor;flex:none}
+.is-ok::before,.panel-hint.is-ok::before,.dv-res b::before{border-radius:50%}
+.is-neg::before,.panel-hint.is-neg::before,.res-fail::before{
+  clip-path:polygon(30% 0,70% 0,100% 30%,100% 70%,70% 100%,30% 100%,0 70%,0 30%)}
+.panel-hint{margin-top:var(--sp-1);font-size:var(--fs-sm)}
+.panel-hint.is-neg{color:var(--sev-danger);font-weight:600}
+.panel-hint.is-ok{color:var(--sev-nominal);font-weight:600}
+.chk-src{display:block;font-size:var(--fs-xs);opacity:.6;margin-top:var(--sp-1)}
+.curve{width:100%;height:90px;display:block}
+
+/* ── 底部中央：字幕 + 提示条 ──────────────────────────────────────────
+   原来两者各自 absolute，bottom 分别是 150 / 196 px 两个互不相干的数，
+   且都靠 left:50% + max-width 百分比定位 —— 1024 宽下字幕会横向压到
+   左下推进剂（68×78）和右侧面板（68×78）上。
+   改成一根 flex 竖列，左右边界由【列宽 token】算出来，任何宽度都不越界。 */
+.hud-bc{position:absolute;bottom:var(--band-safe);
+  left:calc(var(--gutter) + var(--col-w) + var(--sp-4));
+  right:calc(var(--gutter) + var(--col-w) + var(--sp-4));
+  display:flex;flex-direction:column;align-items:center;
+  gap:var(--sp-3);text-align:center}
+.hud-sub{font-size:var(--fs-2xl);line-height:1.45;
+  background:color-mix(in srgb, var(--c-surface) 78%, transparent);
+  border-radius:var(--r-md);padding:var(--sp-2) var(--sp-4);
+  text-shadow:0 2px 12px rgba(0,0,0,.35)}
+.hud-hint{font-size:var(--fs-lg);opacity:.9;
+  background:color-mix(in srgb, var(--c-surface) 70%, transparent);
+  border-radius:var(--r-sm);padding:var(--sp-1) var(--sp-3)}
+.hud-sub:empty,.hud-hint:empty{display:none}
+.hud-alert{position:absolute;left:50%;top:var(--sp-3);transform:translateX(-50%);
+  display:flex;align-items:center;gap:var(--sp-2);
+  padding:var(--sp-2) var(--sp-3);border-radius:var(--r-sm);
+  max-width:calc(100% - 2 * (var(--gutter) + var(--col-w) + var(--sp-4)));
+  background:var(--c-surface);border:1px solid var(--sev-warning);
+  font-size:var(--fs-lg);font-weight:600}
+.hud-center{position:absolute;left:50%;top:34%;transform:translate(-50%,-50%);
+  font-size:var(--fs-4xl);font-weight:700;opacity:0;
+  text-shadow:0 4px 24px rgba(0,0,0,.5)}
+.hud-center.is-show{animation:flash 1.5s ease-out forwards}
+@keyframes flash{0%{opacity:0;transform:translate(-50%,-50%) scale(.9)}
+  15%{opacity:1;transform:translate(-50%,-50%) scale(1)}
+  70%{opacity:1}100%{opacity:0}}
+.hud-badges{position:absolute;right:var(--gutter);bottom:var(--band-badge);
+  display:flex;flex-direction:column;gap:var(--sp-2);align-items:flex-end}
+.badge{background:var(--c-surface);border:1px solid var(--c-accent-gfx);
+  border-radius:var(--r-md);padding:var(--sp-2) var(--sp-3);min-width:220px;
+  animation:slidein .4s ease-out}
+@keyframes slidein{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:none}}
+.badge.is-out{opacity:0;transform:translateX(40px);transition:.6s}
+/* A-1：徽章标题原来用 --c-accent 排 16 px，浅色下 #e07a1f 只有 2.70:1。
+   改 #C2410C（4.64:1，大文本级）+ 字号提到 24 px。 */
+.badge-t{font-weight:700;color:var(--c-accent);font-size:var(--fs-xl)}
+.badge-d{font-size:var(--fs-sm);opacity:.8}
+
+/* ---- 时间线（用户决策 #3：任意拖拽回溯）---------------------------------- */
+.hud-timeline{position:absolute;left:var(--gutter);right:var(--gutter);bottom:52px}
+/* FIX-003 问题 D：.tl 左右各留 52 px 边距。节点是 left:X% + translate(-50%)
+   居中在刻度上，首尾节点的文字必然各有一半甩到轨道外；轨道本来就在
+   .hud-timeline（left/right:24px）里面，24 px 装不下半个标签（4 字标签
+   实测半宽 ≈32 px，1.25× 字号时 ≈40 px），于是被视口切掉。
+   把整条轨道（含节点）内缩 52 px，首尾标签就能完整落在屏幕内。 */
+.tl{position:relative;padding:var(--sp-3) 0 var(--sp-1);margin:0 52px}
+.tl-track{position:relative;height:14px;background:var(--c-surface-2);
+  border:1px solid var(--c-line);border-radius:7px;cursor:pointer}
+.tl-track:focus{outline:3px solid var(--c-accent-gfx);outline-offset:3px}
+.tl-fill{position:absolute;left:0;top:0;bottom:0;background:var(--c-primary-2);
+  border-radius:7px;opacity:.7}
+.tl-handle{position:absolute;top:50%;width:18px;height:26px;margin-left:-9px;
+  transform:translateY(-50%);background:var(--c-accent-gfx);border-radius:4px;
+  border:2px solid var(--c-surface)}
+.tl-node{position:absolute;top:50%;transform:translate(-50%,-50%);
+  background:none;border:0;padding:0 var(--sp-2);cursor:pointer;display:flex;
+  flex-direction:column;align-items:center;gap:2px}
+.tl-dot{width:10px;height:10px;border-radius:50%;background:var(--c-line);
+  border:1px solid var(--c-text-2);display:block}
+.tl-node-text{font-size:var(--fs-xs);opacity:.55;white-space:nowrap}
+.tl-node.is-passed .tl-dot{background:var(--c-primary)}
+.tl-node.is-passed .tl-node-text{opacity:.85}
+.tl-node.is-current .tl-dot{background:var(--c-accent-gfx);transform:scale(1.5)}
+.tl-node.is-current .tl-node-text{opacity:1;font-weight:700}
+.tl-label{margin-top:var(--sp-2);font-size:var(--fs-sm);opacity:.7}
+
+/* ---- 底部控制条（modes.md §4.1 教师控制条）-------------------------------
+   按钮三级权重：
+     主操作（.is-primary）主色实底   —— 一屏之内唯一，0.3 秒内跳出来
+     次操作（默认）      白底描边   —— 常规功能
+     禁用（:disabled）   38% 透明   —— 当前模式下不可用，看得见但点不动
+   原来 12 个按钮全部同款白底，"播放"和"相机"长得一模一样，
+   首次用户只能靠逐个读文字来分辨哪个是开始。                              */
+#ctrl-bar{position:absolute;left:var(--gutter);right:var(--gutter);bottom:var(--sp-2);
+  display:flex;gap:var(--sp-2);align-items:center;pointer-events:auto}
+#ctrl-bar button{min-width:56px;height:44px;padding:0 var(--sp-3);
+  border-radius:var(--r-sm);
+  border:1px solid var(--c-line);background:var(--c-surface);cursor:pointer;
+  font-size:var(--fs-md);transition:background 120ms ease,border-color 120ms ease}
+#ctrl-bar button:hover:not(:disabled){border-color:var(--c-primary)}
+#ctrl-bar button:active:not(:disabled){transform:translateY(1px)}
+/* 按住态（键盘按住时浏览器不会触发 :active，必须由 JS 同步 .is-held）
+   学生按住 ↑ 三秒钟，如果按钮毫无变化，他没法判断"按键到底有没有被接收"——
+   是键盘没插好、还是程序没听见？这是操控类操作最基础的一条即时反馈。 */
+#ctrl-bar button.is-held:not(:disabled){background:var(--c-primary-soft);
+  border-color:var(--c-primary);color:var(--c-primary);
+  transform:translateY(1px);box-shadow:inset 0 2px 5px rgba(0,0,0,.14)}
+html[data-theme="dark"] #ctrl-bar button.is-held:not(:disabled){
+  border-color:var(--c-accent-gfx);color:var(--c-accent-gfx)}
+#ctrl-bar button:disabled{opacity:.38;cursor:not-allowed}
+#ctrl-bar button:focus-visible{outline:3px solid var(--c-accent-gfx);outline-offset:2px}
+#ctrl-bar button.is-primary{background:var(--c-primary);color:#fff;
+  border-color:var(--c-primary);font-weight:600;min-width:104px}
+#ctrl-bar button.is-primary:hover:not(:disabled){background:var(--c-primary-2);
+  border-color:var(--c-primary-2)}
+/* 深色主题的 --c-primary 是浅蓝 #6fb6ea，白字上去只有约 1.9:1 —— 换成深字 */
+html[data-theme="dark"] #ctrl-bar button.is-primary{color:#05121f}
+html[data-theme="dark"] #ctrl-bar button.is-primary:hover:not(:disabled){
+  background:var(--c-primary);border-color:#9ad0f5;filter:brightness(1.12)}
+/* 待发射状态：主按钮呼吸提示，把"从哪开始"直接钉在视觉焦点上 */
+#ctrl-bar button.is-cta{animation:cta 2.2s ease-in-out infinite}
+@keyframes cta{
+  0%,100%{box-shadow:0 0 0 0 color-mix(in srgb,var(--c-accent-gfx) 30%,transparent)}
+  50%{box-shadow:0 0 0 8px transparent}}
+@media (prefers-reduced-motion:reduce){#ctrl-bar button.is-cta{animation:none}}
+#ctrl-bar .sp{flex:1}
+#ctrl-bar .grp{display:flex;gap:var(--sp-2);align-items:center}
+#ctrl-bar .lbl{font-size:var(--fs-sm);opacity:.6}
+#ctrl-bar .grp.is-off .lbl{opacity:.32}
+
+/* ---- 浮层面板 ------------------------------------------------------------ */
+.overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.45);z-index:20;pointer-events:auto}
+.panel-card{background:var(--c-surface);border:1px solid var(--c-line);
+  border-radius:var(--r-lg);padding:var(--sp-5) var(--sp-6);max-width:720px;
+  width:calc(100% - 64px);
+  max-height:82vh;overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,.35)}
+.panel-card h2{margin:0 0 var(--sp-1);font-size:var(--fs-xl)}
+.panel-card h3{margin:0 0 var(--sp-2);font-size:var(--fs-lg)}
+.panel-card p{margin:var(--sp-2) 0;line-height:1.6;font-size:var(--fs-md)}
+.res-fail{color:var(--sev-danger)}
+.res-grade{font-size:var(--fs-2xl);font-weight:700;color:var(--c-accent)}
+.res-total{font-size:var(--fs-xl);font-family:var(--mono);
+  font-variant-numeric:tabular-nums}
+.res-score{display:flex;align-items:baseline;gap:var(--sp-4);margin:var(--sp-3) 0}
+.res-parts,.res-note{font-family:var(--mono);font-variant-numeric:tabular-nums;opacity:.85}
+.res-new{color:var(--c-accent);font-weight:700}
+.coast-key{font-size:var(--fs-xl);font-family:var(--mono);
+  font-variant-numeric:tabular-nums}
+.coast-list{margin:var(--sp-2) 0 0 var(--sp-5);padding:0}
+.coast-list li{margin:var(--sp-2) 0;line-height:1.5}
+.set-row{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3);
+  padding:var(--sp-2) 0;border-bottom:1px dashed var(--c-line)}
+.set-row--stack{flex-direction:column;align-items:stretch;gap:var(--sp-2)}
+.set-row label{font-size:var(--fs-md)}
+/* 载荷固定为 26 t（只有这一档标定过），所以这一项不是下拉框而是静态文本。
+   用 .set-static 而不是 <label>+<select>，避免出现"只有一个选项的下拉框"。 */
+.set-row .set-static{font-size:var(--fs-md);opacity:.75}
+.set-row select,.set-row input[type=range]{min-height:36px}
+.set-note{font-size:var(--fs-xs);opacity:.6;margin-top:var(--sp-1)}
+
+/* 分段控件：把"展开下拉 → 选选项"两步并成"点一下"。
+   模式切换是除播放之外最高频的操作，不该藏在 select 里。 */
+.seg{display:flex;background:var(--c-surface-2);border:1px solid var(--c-line);
+  border-radius:var(--r-sm);padding:var(--sp-1);gap:var(--sp-1)}
+.seg-btn{flex:1;background:transparent;border:0;border-radius:4px;
+  padding:var(--sp-2) var(--sp-4);min-height:44px;cursor:pointer;
+  font-size:var(--fs-md);color:var(--c-text-2);
+  transition:background 120ms ease,color 120ms ease}
+.seg-btn:hover{color:var(--c-text)}
+.seg-btn[aria-pressed="true"]{background:var(--c-primary);color:#fff;font-weight:600}
+html[data-theme="dark"] .seg-btn[aria-pressed="true"]{color:#05121f}
+.seg-btn:focus-visible{outline:3px solid var(--c-accent-gfx);outline-offset:2px}
+
+.btn-row{display:flex;gap:var(--sp-3);justify-content:flex-end;
+  align-items:center;margin-top:var(--sp-4)}
+.btn-primary{background:var(--c-primary);color:#fff;border:0;border-radius:var(--r-sm);
+  padding:var(--sp-3) var(--sp-5);cursor:pointer;font-weight:600;font-size:var(--fs-md)}
+.btn-plain{background:var(--c-surface-2);border:1px solid var(--c-line);
+  border-radius:var(--r-sm);padding:var(--sp-3) var(--sp-5);cursor:pointer;
+  font-size:var(--fs-md)}
+html[data-theme="dark"] .btn-primary{color:#05121f}
+.btn-primary:hover{filter:brightness(1.12)}
+.btn-plain:hover{border-color:var(--c-primary)}
+.btn-primary:focus-visible,.btn-plain:focus-visible{
+  outline:3px solid var(--c-accent-gfx);outline-offset:2px}
+.kbd{font-family:var(--mono);background:var(--c-surface-2);border:1px solid var(--c-line);
+  border-radius:4px;padding:1px var(--sp-2);font-size:var(--fs-xs)}
+table.keys{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
+table.keys td{padding:var(--sp-1) var(--sp-2);border-bottom:1px solid var(--c-line)}
+table.keys td:first-child{white-space:nowrap;width:130px}
+
+/* ── 窄屏适配：只改四个骨架 token，全站版面跟着收，不用逐个补丁 ──────────
+   1200px 以下把左右列收窄 40px、安全边距收到 16px，
+   底部中央字幕带因此从 760px 自动变成 440px，仍不与两侧列相撞。 */
+@media (max-width:1200px){
+  :root{--gutter:16px;--col-w:260px}
+  /* 控制条在 1024 宽下原本内容 960 + 间隙 32 = 992，正好等于可用宽度 992，
+     零余量 —— 换成另一种系统字体渲染就可能撑爆（按钮被挤出屏幕）。
+     这里收窄内边距与最小宽度，腾出约 140px 余量。 */
+  #ctrl-bar{gap:var(--sp-1)}
+  #ctrl-bar button{min-width:44px;padding:0 var(--sp-2)}
+  #ctrl-bar button.is-primary{min-width:88px}
+}
+
+/* 形状编码关闭时（教师可关，但默认开）：隐藏形状标记只留颜色 */
+.no-shapes .ro-mark{display:none}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="fx-canvas"></canvas>
+  <div id="rocket-layer"></div>
+  <div id="hud-root"></div>
+
+  <div id="ctrl-bar">
+    <div class="grp">
+      <button id="btn-play" class="is-primary" title="播放（空格）">▶ 播放</button>
+      <button id="btn-warp" title="倍速（1–6 数字键）">×1</button>
+      <button id="btn-restart" title="重新开始（R）">↻ 重来</button>
+      <button id="btn-camera" title="相机切换（C）">相机</button>
+    </div>
+    <div class="sp"></div>
+    <div class="grp" id="grp-fly">
+      <span class="lbl">弹道</span>
+      <button id="btn-up" title="抬高弹道（↑ / W）—— 让火箭爬得更陡，飞得更高，但水平速度攒得慢">▲</button>
+      <button id="btn-down" title="压低弹道（↓ / S）—— 把速度倒向水平方向。入轨靠的是水平速度，转弯主要按这个">▼</button>
+      <span class="lbl">节流</span>
+      <button id="btn-thr-down" title="减小油门（Q）—— 空气最稠密时降推力，可减小过载与气动载荷">−</button>
+      <button id="btn-thr-up" title="加大油门（E）—— 空气变稀薄后恢复满推力">＋</button>
+      <button id="btn-ignite" title="三级点火">三级点火</button>
+      <button id="btn-cutoff" title="三级关机（空格）">三级关机</button>
+    </div>
+    <div class="sp"></div>
+    <div class="grp">
+      <button id="btn-help" title="操作说明（/）">操作说明</button>
+      <button id="btn-settings" title="设置（Esc）">设置</button>
+    </div>
+  </div>
+</div>
+
+<!-- 滑行段讲解浮层（用户决策 #7：演示模式自动暂停时弹出，可一键关闭） -->
+<div id="coast-panel" class="overlay" style="display:none">
+  <div class="panel-card">
+    <h2>滑行段 · 全局最重要的三分钟</h2>
+    <div id="coast-body"></div>
+    <div class="btn-row">
+      <button class="btn-primary" id="btn-resume-coast">继续播放</button>
+    </div>
+  </div>
+</div>
+
+<!-- 结算面板 -->
+<div id="result-panel" class="overlay" style="display:none">
+  <div class="panel-card">
+    <div id="result-body"></div>
+    <div class="btn-row">
+      <button class="btn-plain" id="btn-close-result">关闭</button>
+      <button class="btn-primary" id="btn-replay">再看一次</button>
+    </div>
+  </div>
+</div>
+
+<!-- 设置面板 -->
+<div id="settings-panel" class="overlay" style="display:none">
+  <div class="panel-card">
+    <h2>设置</h2>
+    <div class="set-row set-row--stack">
+      <label id="set-mode-label">模式</label>
+      <div class="seg" id="set-mode" role="group" aria-labelledby="set-mode-label">
+        <button type="button" class="seg-btn" data-value="demo"
+                aria-pressed="true">演示模式 · 教师讲解</button>
+        <button type="button" class="seg-btn" data-value="challenge"
+                aria-pressed="false">挑战模式 · 学生自己开</button>
+      </div>
+    </div>
+    <div class="set-note">演示模式禁用全部失败判定、锁死玩家输入，并强制浅色主题。</div>
+
+    <div class="set-row">
+      <label for="set-difficulty">难度档</label>
+      <select id="set-difficulty">
+        <!-- ⚠ 难度档【不改载荷】—— 载荷固定 26 t，由 modes.js 的 payloadT 决定
+           （steering.js 的 DIFFICULTY[*].payload 从未生效，已删除）。
+           早期这里写"入门（14 t …）"，但 set-difficulty 只设 director.difficulty，
+           选入门档实际跑的还是 26 t —— 文案在撒谎，已于 2026-09-03 改正。 -->
+        <option value="easy">入门（26 t，三级全自动，阈值放宽 ×1.3）</option>
+        <option value="normal">标准（26 t，三级自动关机，手动点火）</option>
+        <option value="hard">硬核（26 t，三级手动关机，全手动姿态）</option>
+      </select>
+    </div>
+
+    <div class="set-row">
+      <label for="set-target">目标轨道</label>
+      <select id="set-target">
+        <option value="200">200 km 停泊轨道</option>
+        <option value="400">400 km 空间站轨道</option>
+      </select>
+    </div>
+
+    <!-- 载荷固定为 26 t（用户决策 #5：梦舟深空版）。
+         ⚠ 这里曾经是一个 26 / 14 / 70 t 的下拉框，但 14 t 与 70 t 的弹道
+           从未标定过：14 t 远地点冲高到 252 km（目标 200 km），全程无任何
+           失败事件却判"未入轨"；70 t 在演示模式下会判"入轨"，实测
+           hp = −6368 km（整条轨道在地心以下）、peakQ 575 kPa。
+           两个选项已于 2026-09-03 删除，只剩标定过的 26 t。 -->
+    <div class="set-row">
+      <span class="set-static">载荷（梦舟载人飞船）</span>
+      <span class="set-static">梦舟 · 深空版 26 t</span>
+    </div>
+
+    <div class="set-row">
+      <label for="set-theme">主题</label>
+      <select id="set-theme">
+        <option value="light">浅色</option>
+        <option value="dark">深色</option>
+      </select>
+    </div>
+    <div class="set-note">演示模式强制浅色（投影可读性优先），此开关在演示模式下不可用。</div>
+
+    <div class="set-row">
+      <label for="set-cutaway">整流罩半透明剖视</label>
+      <input type="checkbox" id="set-cutaway">
+    </div>
+    <div class="set-note">开启后可看到整流罩内的梦舟载人飞船。</div>
+
+    <div class="set-row">
+      <label for="set-coast">滑行段自动暂停</label>
+      <input type="checkbox" id="set-coast">
+    </div>
+
+    <div class="set-row">
+      <label for="set-manual-cutoff">标准档也手动关机三级</label>
+      <input type="checkbox" id="set-manual-cutoff">
+    </div>
+    <div class="set-note">默认按用户决策（标准档自动）。需要按 GDD 上课时可打开此项。</div>
+
+    <div class="set-row">
+      <label for="set-guide">引导强度</label>
+      <select id="set-guide">
+        <option value="G1">G1 手把手</option>
+        <option value="G2">G2 仅关键提示</option>
+        <option value="G3">G3 无引导</option>
+      </select>
+    </div>
+
+    <div class="set-row">
+      <label for="set-motion">减弱动效（前庭安全）</label>
+      <input type="checkbox" id="set-motion">
+    </div>
+
+    <div class="set-row">
+      <label for="set-shapes">严重度用形状编码</label>
+      <input type="checkbox" id="set-shapes">
+    </div>
+
+    <div class="set-row">
+      <label for="set-residual">显示 Δv 恒等式残差</label>
+      <input type="checkbox" id="set-residual">
+    </div>
+
+    <div class="set-row">
+      <label for="set-font">字号缩放</label>
+      <select id="set-font">
+        <option value="0.85">0.85×</option>
+        <option value="1">1.0×</option>
+        <option value="1.25">1.25×</option>
+      </select>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn-primary" id="btn-close-settings">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- 帮助面板 -->
+<div id="help-panel" class="overlay" style="display:none">
+  <div class="panel-card">
+    <h2>操作说明</h2>
+    <h3>演示模式</h3>
+    <table class="keys">
+      <tr><td><span class="kbd">空格</span></td><td>播放 / 暂停</td></tr>
+      <tr><td><span class="kbd">← →</span></td><td>上一 / 下一事件节点</td></tr>
+      <tr><td><span class="kbd">↑ ↓</span></td><td>倍速 + / −</td></tr>
+      <tr><td><span class="kbd">D</span></td><td>数据层循环（L0 最少 → L3 全部）</td></tr>
+      <tr><td><span class="kbd">C</span></td><td>相机：跟随 / 全景 / 轨道俯视</td></tr>
+      <tr><td><span class="kbd">R</span></td><td>重来</td></tr>
+      <tr><td><span class="kbd">Esc</span></td><td>设置</td></tr>
+      <tr><td>鼠标</td><td>拖动底部时间线可回溯到任意时刻；点击节点直接跳转</td></tr>
+    </table>
+    <h3>挑战模式</h3>
+    <table class="keys">
+      <tr><td><span class="kbd">↑</span> <span class="kbd">W</span></td><td>抬头（bias +）</td></tr>
+      <tr><td><span class="kbd">↓</span> <span class="kbd">S</span></td><td>低头（bias −）</td></tr>
+      <tr><td><span class="kbd">Q</span> <span class="kbd">E</span></td><td>节流 − / +（步进 5%）</td></tr>
+      <tr><td><span class="kbd">空格</span></td><td>上下文主操作：点火 / 三级点火 / 三级关机 / 暂停</td></tr>
+      <tr><td><span class="kbd">1</span>–<span class="kbd">6</span></td><td>倍速 1 / 2 / 5 / 10 / 25 / 50×</td></tr>
+      <tr><td><span class="kbd">Tab</span></td><td>右侧数据面板折叠 / 展开</td></tr>
+      <tr><td><span class="kbd">P</span> <span class="kbd">R</span></td><td>暂停 / 重来</td></tr>
+    </table>
+    <p class="set-note">所有键盘功能在 HUD 上都有对应按钮，触屏大屏可直接使用底部控制条。</p>
+    <div class="btn-row">
+      <button class="btn-primary" id="btn-close-help">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===========================================================================
+     脚本加载：严格按依赖顺序，全部为传统脚本（无 type="module"，见 adr-001）
+     =========================================================================== -->
+<script>
+  // 全局命名空间。所有模块挂在 window.RK 上，避免污染全局、也方便控制台调试。
+  window.RK = window.RK || {};
+</script>
+<script src="src/core/constants.js"></script>
+<script src="src/core/atmo.js"></script>
+<script src="src/core/vehicle.js"></script>
+<script src="src/core/dynamics.js"></script>
+<script src="src/core/orbit.js"></script>
+<script src="src/core/steering.js"></script>
+<script src="src/core/sim.js"></script>
+<script src="src/app/replay.js"></script>
+<script src="src/app/config.js"></script>
+<script src="src/app/a11y.js"></script>
+<script src="src/app/input.js"></script>
+<script src="src/app/timeline.js"></script>
+<script src="src/app/svg-rocket.js"></script>
+<script src="src/app/render.js"></script>
+<script src="src/app/hud.js"></script>
+<script src="src/app/modes.js"></script>
+<script src="src/app/score.js"></script>
+<script src="src/app/main.js"></script>
+</body>
+</html>
